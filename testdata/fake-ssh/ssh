@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+# Stand-in for ssh in tests: handles `ssh -L local:localhost:remote ... host`
+# by proxying 127.0.0.1:local to 127.0.0.1:remote on this machine.
+# The host "badhost" fails like an unreachable server.
+import socket, sys, threading, time
+
+args = sys.argv[1:]
+host = args[-1]
+if host == "badhost":
+    time.sleep(0.2)
+    sys.stderr.write("ssh: connect to host badhost port 22: Connection refused\n")
+    sys.exit(255)
+
+local_port, _, remote_port = args[args.index("-L") + 1].split(":")
+time.sleep(0.3)  # connection latency
+
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    srv.bind(("127.0.0.1", int(local_port)))
+except OSError:
+    sys.stderr.write("bind [127.0.0.1]:%s: Address already in use\n" % local_port)
+    sys.exit(255)
+srv.listen()
+
+
+def pipe(a, b):
+    try:
+        while True:
+            data = a.recv(4096)
+            if not data:
+                break
+            b.sendall(data)
+    except OSError:
+        pass
+    finally:
+        a.close()
+        b.close()
+
+
+while True:
+    client, _ = srv.accept()
+    try:
+        remote = socket.create_connection(("127.0.0.1", int(remote_port)))
+    except OSError:
+        client.close()
+        continue
+    threading.Thread(target=pipe, args=(client, remote), daemon=True).start()
+    threading.Thread(target=pipe, args=(remote, client), daemon=True).start()
