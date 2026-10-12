@@ -1,12 +1,12 @@
 #!/bin/bash
 
-echo "kport - SSH Port Forwarder Demo"
+echo "lport - SSH Port Forwarder Demo"
 echo "==============================="
 echo ""
 echo "This application requires a proper terminal to run the TUI interface."
 echo ""
 echo "In a real terminal, you would run:"
-echo "  ./kport"
+echo "  ./lport"
 echo ""
 echo "Expected behavior when selecting hosts:"
 echo "• test-server & dev-server: Will show 'Could not connect' (they're fake hosts)"
@@ -21,4 +21,4 @@ echo "5. Either detect ports or show connection error"
 echo "6. Allow manual port forwarding with 'm' key"
 echo ""
 echo "Testing SSH config parsing:"
-./kport --test
+./lport --test

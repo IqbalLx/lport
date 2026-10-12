@@ -1,32 +1,47 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"net"
-	"os"
 	"os/exec"
-	"strconv"
+	"strings"
 	"sync"
+	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
-// ForwardingStartedMsg is sent when port forwarding starts
-type ForwardingStartedMsg struct {
-	LocalPort  int
+// ForwardReadyMsg is sent when a forwarder is accepting connections on localhost
+type ForwardReadyMsg struct {
+	ID         int
 	RemotePort int
 }
 
-// PortForwarder manages SSH port forwarding using ssh command
+// ForwardFailedMsg is sent when a forwarder could not be established
+type ForwardFailedMsg struct {
+	ID         int
+	RemotePort int
+	Error      error
+}
+
+// ForwardExitedMsg is sent when an established forwarder's ssh process exits
+type ForwardExitedMsg struct {
+	ID         int
+	RemotePort int
+	Error      error
+}
+
+// PortForwarder manages a single SSH port forward using the ssh command
 type PortForwarder struct {
-	hostName     string
-	localPort    int
-	remotePort   int
-	sshCmd       *exec.Cmd
-	stopChan     chan struct{}
-	wg           sync.WaitGroup
-	isRunning    bool
-	mu           sync.Mutex
+	hostName   string
+	localPort  int
+	remotePort int
+	sshCmd     *exec.Cmd
+	stderr     bytes.Buffer
+	done       chan struct{}
+	exitErr    error
+	stopOnce   sync.Once
 }
 
 // NewPortForwarder creates a new port forwarder using ssh command
@@ -35,161 +50,115 @@ func NewPortForwarder(hostName string, localPort, remotePort int) *PortForwarder
 		hostName:   hostName,
 		localPort:  localPort,
 		remotePort: remotePort,
-		stopChan:   make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 }
 
-// Start starts the port forwarding using ssh command
+// Start launches the ssh process. It returns once the process is spawned;
+// use WaitReady to know when the tunnel actually accepts connections.
 func (pf *PortForwarder) Start() error {
-	pf.mu.Lock()
-	defer pf.mu.Unlock()
-
-	if pf.isRunning {
-		return fmt.Errorf("port forwarding already running")
-	}
-
-	// Use ssh command with -L flag for local port forwarding
 	// Format: ssh -L localport:localhost:remoteport hostname
-	pf.sshCmd = exec.Command("ssh", 
+	pf.sshCmd = exec.Command("ssh",
 		"-L", fmt.Sprintf("%d:localhost:%d", pf.localPort, pf.remotePort),
-		"-N", // Don't execute remote command, just forward ports
+		"-N",                             // Don't execute remote command, just forward ports
 		"-o", "ExitOnForwardFailure=yes", // Exit if port forwarding fails
+		"-o", "BatchMode=yes", // Never prompt; prompts would corrupt the TUI
+		"-o", "ConnectTimeout=15",
 		"-o", "ServerAliveInterval=30", // Keep connection alive
 		"-o", "ServerAliveCountMax=3",
 		pf.hostName)
+	// Capture stderr so ssh messages don't draw over the TUI and can be shown as errors
+	pf.sshCmd.Stderr = &pf.stderr
 
-	fmt.Fprintf(os.Stderr, "Debug: Starting SSH command: %s\n", pf.sshCmd.String())
-
-	// Start the SSH command
 	if err := pf.sshCmd.Start(); err != nil {
-		return fmt.Errorf("failed to start SSH port forwarding: %w", err)
+		return fmt.Errorf("failed to start ssh: %w", err)
 	}
 
-	pf.isRunning = true
-
-	// Monitor the SSH process
-	pf.wg.Add(1)
-	go pf.monitorSSH()
+	go func() {
+		pf.exitErr = pf.sshCmd.Wait()
+		close(pf.done)
+	}()
 
 	return nil
 }
 
-// Stop stops the port forwarding
+// WaitReady blocks until the local port accepts connections, the ssh process
+// exits, or the timeout elapses.
+func (pf *PortForwarder) WaitReady(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	addr := fmt.Sprintf("127.0.0.1:%d", pf.localPort)
+
+	for {
+		select {
+		case <-pf.done:
+			return pf.exitError()
+		default:
+		}
+
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for tunnel")
+		}
+
+		select {
+		case <-pf.done:
+			return pf.exitError()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// Done returns a channel that is closed when the ssh process exits
+func (pf *PortForwarder) Done() <-chan struct{} {
+	return pf.done
+}
+
+// Stop kills the ssh process and waits for it to exit
 func (pf *PortForwarder) Stop() {
-	pf.mu.Lock()
-	defer pf.mu.Unlock()
-
-	if !pf.isRunning {
-		return
-	}
-
-	pf.isRunning = false
-	close(pf.stopChan)
-
-	// Kill the SSH process
-	if pf.sshCmd != nil && pf.sshCmd.Process != nil {
-		fmt.Fprintf(os.Stderr, "Debug: Stopping SSH port forwarding\n")
+	pf.stopOnce.Do(func() {
+		if pf.sshCmd == nil || pf.sshCmd.Process == nil {
+			return
+		}
 		pf.sshCmd.Process.Kill()
-	}
-
-	pf.wg.Wait()
+		<-pf.done
+	})
 }
 
-// monitorSSH monitors the SSH process
-func (pf *PortForwarder) monitorSSH() {
-	defer pf.wg.Done()
-
-	// Wait for the SSH command to finish or be stopped
-	select {
-	case <-pf.stopChan:
-		// We were asked to stop
-		return
-	default:
-		// Wait for SSH command to finish
-		if err := pf.sshCmd.Wait(); err != nil {
-			fmt.Fprintf(os.Stderr, "Debug: SSH command finished with error: %v\n", err)
-		} else {
-			fmt.Fprintf(os.Stderr, "Debug: SSH command finished successfully\n")
-		}
+// exitError describes why the ssh process exited. Only valid after done is closed.
+func (pf *PortForwarder) exitError() error {
+	lines := strings.Split(strings.TrimSpace(pf.stderr.String()), "\n")
+	if last := strings.TrimSpace(lines[len(lines)-1]); last != "" {
+		return fmt.Errorf("%s", last)
 	}
+	if pf.exitErr != nil {
+		return fmt.Errorf("ssh exited: %w", pf.exitErr)
+	}
+	return fmt.Errorf("ssh exited")
 }
 
-// StartPortForwarding starts port forwarding for a specific port
-func StartPortForwarding(host SSHHost, remotePort int) tea.Cmd {
+// WaitForwardReady waits for a started forwarder to become usable
+func WaitForwardReady(id int, pf *PortForwarder) tea.Cmd {
 	return func() tea.Msg {
-		fmt.Fprintf(os.Stderr, "Debug: Starting port forwarding for %s:%d\n", host.Name, remotePort)
-		
-		// Try to use the same port locally, fallback to random if unavailable
-		localPort, samePort, err := findPreferredLocalPort(remotePort)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Debug: Failed to find available port: %v\n", err)
-			return ErrorMsg{Error: fmt.Errorf("failed to find available local port: %w", err)}
+		if err := pf.WaitReady(30 * time.Second); err != nil {
+			pf.Stop()
+			return ForwardFailedMsg{ID: id, RemotePort: pf.remotePort, Error: err}
 		}
-		if samePort {
-			fmt.Fprintf(os.Stderr, "Debug: Using same port locally: %d\n", localPort)
-		} else {
-			fmt.Fprintf(os.Stderr, "Debug: Port %d unavailable, using alternative: %d\n", remotePort, localPort)
-		}
-
-		// Create and start port forwarder using ssh command
-		forwarder := NewPortForwarder(host.Name, localPort, remotePort)
-		if err := forwarder.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "Debug: Failed to start port forwarder: %v\n", err)
-			return ErrorMsg{Error: fmt.Errorf("failed to start port forwarding: %w", err)}
-		}
-		fmt.Fprintf(os.Stderr, "Debug: Port forwarder started successfully\n")
-
-		return ForwardingStartedMsg{
-			LocalPort:  localPort,
-			RemotePort: remotePort,
-		}
+		return ForwardReadyMsg{ID: id, RemotePort: pf.remotePort}
 	}
 }
 
-// StartManualPortForwarding starts port forwarding for a manually entered port
-func StartManualPortForwarding(host SSHHost, portStr string) tea.Cmd {
+// WaitForwardExit reports when an established forwarder's ssh process exits
+func WaitForwardExit(id int, pf *PortForwarder) tea.Cmd {
 	return func() tea.Msg {
-		fmt.Fprintf(os.Stderr, "Debug: Manual port forwarding requested for %s:%s\n", host.Name, portStr)
-		
-		remotePort, err := strconv.Atoi(portStr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Debug: Invalid port number: %s\n", portStr)
-			return ErrorMsg{Error: fmt.Errorf("invalid port number: %s", portStr)}
-		}
-
-		if remotePort <= 0 || remotePort > 65535 {
-			fmt.Fprintf(os.Stderr, "Debug: Port number out of range: %d\n", remotePort)
-			return ErrorMsg{Error: fmt.Errorf("port number must be between 1 and 65535")}
-		}
-
-		// Try to use the same port locally, fallback to random if unavailable
-		localPort, samePort, err := findPreferredLocalPort(remotePort)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Debug: Failed to find available port: %v\n", err)
-			return ErrorMsg{Error: fmt.Errorf("failed to find available local port: %w", err)}
-		}
-		if samePort {
-			fmt.Fprintf(os.Stderr, "Debug: Using same port locally: %d\n", localPort)
-		} else {
-			fmt.Fprintf(os.Stderr, "Debug: Port %d unavailable, using alternative: %d\n", remotePort, localPort)
-		}
-
-		// Create and start port forwarder using ssh command
-		forwarder := NewPortForwarder(host.Name, localPort, remotePort)
-		if err := forwarder.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "Debug: Failed to start port forwarder: %v\n", err)
-			return ErrorMsg{Error: fmt.Errorf("failed to start port forwarding: %w", err)}
-		}
-		fmt.Fprintf(os.Stderr, "Debug: Port forwarder started successfully\n")
-
-		return ForwardingStartedMsg{
-			LocalPort:  localPort,
-			RemotePort: remotePort,
-		}
+		<-pf.Done()
+		return ForwardExitedMsg{ID: id, RemotePort: pf.remotePort, Error: pf.exitError()}
 	}
 }
-
-
 
 // findPreferredLocalPort tries to use the same port as remote, fallback to random
 func findPreferredLocalPort(remotePort int) (localPort int, samePort bool, err error) {
@@ -197,23 +166,27 @@ func findPreferredLocalPort(remotePort int) (localPort int, samePort bool, err e
 	if isPortAvailable(remotePort) {
 		return remotePort, true, nil
 	}
-	
+
 	// If same port is not available, find any available port
 	availablePort, err := findAvailablePort()
 	if err != nil {
 		return 0, false, err
 	}
-	
+
 	return availablePort, false, nil
 }
 
-// isPortAvailable checks if a specific port is available locally
+// isPortAvailable checks if a specific port is available locally. Loopback is
+// checked explicitly since that's where ssh binds, and on some systems a
+// wildcard bind succeeds even when loopback is taken.
 func isPortAvailable(port int) bool {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		return false
+	for _, addr := range []string{fmt.Sprintf("127.0.0.1:%d", port), fmt.Sprintf(":%d", port)} {
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			return false
+		}
+		listener.Close()
 	}
-	listener.Close()
 	return true
 }
 

@@ -2,10 +2,13 @@ package main
 
 import (
 	"fmt"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // AppState represents the current state of the application
@@ -16,9 +19,25 @@ const (
 	StateConnecting
 	StateSelectPort
 	StateManualPort
-	StateStartingForward
-	StateForwarding
 )
+
+// ForwardStatus is the state of a single port forward
+type ForwardStatus int
+
+const (
+	ForwardStarting ForwardStatus = iota
+	ForwardActive
+	ForwardFailed
+)
+
+// portForward tracks a forward for one remote port
+type portForward struct {
+	id        int
+	status    ForwardStatus
+	localPort int
+	forwarder *PortForwarder
+	err       error
+}
 
 // Model represents the TUI model
 type Model struct {
@@ -27,10 +46,10 @@ type Model struct {
 	hosts       []SSHHost
 	selectedHost int
 	ports       []int
-	selectedPort int
 	cursor      int
 	manualPort  string
-	forwarder   *PortForwarder
+	forwards    map[int]*portForward // keyed by remote port
+	nextID      int
 	message     string
 	err         error
 }
@@ -41,6 +60,7 @@ func NewModel() *Model {
 		state:     StateSelectHost,
 		sshConfig: NewSSHConfig(),
 		cursor:    0,
+		forwards:  make(map[int]*portForward),
 	}
 }
 
@@ -66,7 +86,7 @@ func (m *Model) Init() tea.Cmd {
 // Update handles messages and updates the model
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch m.state {
 		case StateSelectHost:
 			return m.updateHostSelection(msg)
@@ -76,12 +96,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updatePortSelection(msg)
 		case StateManualPort:
 			return m.updateManualPort(msg)
-		case StateStartingForward:
-			return m.updateStartingForward(msg)
-		case StateForwarding:
-			return m.updateForwarding(msg)
 		}
 	case PortsDetectedMsg:
+		// Ignore late results if the user cancelled the connection
+		if m.state != StateConnecting {
+			return m, nil
+		}
 		m.ports = msg.Ports
 		m.state = StateSelectPort
 		m.cursor = 0
@@ -92,39 +112,38 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.message = ""
 		}
 		return m, nil
-	case ForwardingStartedMsg:
-		if msg.LocalPort == msg.RemotePort {
-			m.message = fmt.Sprintf("Port forwarding started: localhost:%d -> %s:%d (same port)", 
-				msg.LocalPort, m.hosts[m.selectedHost].Name, msg.RemotePort)
-		} else {
-			m.message = fmt.Sprintf("Port forwarding started: localhost:%d -> %s:%d (port %d was unavailable)", 
-				msg.LocalPort, m.hosts[m.selectedHost].Name, msg.RemotePort, msg.RemotePort)
+	case ForwardReadyMsg:
+		pf := m.forwards[msg.RemotePort]
+		if pf == nil || pf.id != msg.ID {
+			return m, nil
 		}
-		m.state = StateForwarding
+		pf.status = ForwardActive
+		return m, WaitForwardExit(pf.id, pf.forwarder)
+	case ForwardFailedMsg:
+		pf := m.forwards[msg.RemotePort]
+		if pf == nil || pf.id != msg.ID {
+			return m, nil
+		}
+		pf.status = ForwardFailed
+		pf.err = msg.Error
+		return m, nil
+	case ForwardExitedMsg:
+		pf := m.forwards[msg.RemotePort]
+		if pf == nil || pf.id != msg.ID {
+			return m, nil
+		}
+		pf.status = ForwardFailed
+		pf.err = fmt.Errorf("connection lost: %v", msg.Error)
 		return m, nil
 	case ErrorMsg:
-		// Don't quit on errors, just show them and let user continue
 		m.message = fmt.Sprintf("Error: %v", msg.Error)
-		// Go back to appropriate state depending on current state
-		switch m.state {
-		case StateConnecting:
-			m.state = StateSelectPort
-			m.ports = []int{} // Show empty ports list
-		case StateStartingForward:
-			// Go back to port selection or manual port depending on where we came from
-			if len(m.ports) > 0 {
-				m.state = StateSelectPort
-			} else {
-				m.state = StateManualPort
-			}
-		}
 		return m, nil
 	}
 	return m, nil
 }
 
 // updateHostSelection handles host selection state
-func (m *Model) updateHostSelection(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) updateHostSelection(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c", "q":
 		return m, tea.Quit
@@ -136,7 +155,7 @@ func (m *Model) updateHostSelection(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.cursor < len(m.hosts)-1 {
 			m.cursor++
 		}
-	case "enter", " ":
+	case "enter", "space":
 		m.selectedHost = m.cursor
 		m.state = StateConnecting
 		m.message = fmt.Sprintf("Connecting to %s...", m.hosts[m.selectedHost].Name)
@@ -145,15 +164,17 @@ func (m *Model) updateHostSelection(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "m":
 		// Manual port forwarding
 		m.selectedHost = m.cursor
+		m.ports = nil
 		m.state = StateManualPort
 		m.manualPort = ""
+		m.message = ""
 		return m, nil
 	}
 	return m, nil
 }
 
 // updateConnecting handles connecting state
-func (m *Model) updateConnecting(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) updateConnecting(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c", "q":
 		return m, tea.Quit
@@ -167,13 +188,16 @@ func (m *Model) updateConnecting(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // updatePortSelection handles port selection state
-func (m *Model) updatePortSelection(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) updatePortSelection(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c", "q":
+		m.stopAllForwards()
 		return m, tea.Quit
 	case "esc":
+		m.stopAllForwards()
 		m.state = StateSelectHost
 		m.cursor = m.selectedHost
+		m.message = ""
 		return m, nil
 	case "up", "k":
 		if m.cursor > 0 {
@@ -183,27 +207,29 @@ func (m *Model) updatePortSelection(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.cursor < len(m.ports)-1 {
 			m.cursor++
 		}
-	case "enter", " ":
-		m.selectedPort = m.cursor
-		m.state = StateStartingForward
-		m.message = "Starting port forwarding..."
-		// Start port forwarding
-		return m, StartPortForwarding(m.hosts[m.selectedHost], m.ports[m.selectedPort])
+	case "enter", "space":
+		if len(m.ports) == 0 {
+			return m, nil
+		}
+		return m, m.toggleForward(m.ports[m.cursor])
 	case "m":
 		// Manual port forwarding
 		m.state = StateManualPort
 		m.manualPort = ""
+		m.message = ""
 		return m, nil
 	}
 	return m, nil
 }
 
 // updateManualPort handles manual port input state
-func (m *Model) updateManualPort(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) updateManualPort(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c", "q":
+		m.stopAllForwards()
 		return m, tea.Quit
 	case "esc":
+		m.message = ""
 		if len(m.ports) > 0 {
 			m.state = StateSelectPort
 		} else {
@@ -211,12 +237,22 @@ func (m *Model) updateManualPort(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "enter":
-		if m.manualPort != "" {
-			m.state = StateStartingForward
-			m.message = "Starting port forwarding..."
-			// Parse and start manual port forwarding
-			return m, StartManualPortForwarding(m.hosts[m.selectedHost], m.manualPort)
+		if m.manualPort == "" {
+			return m, nil
 		}
+		port, err := strconv.Atoi(m.manualPort)
+		if err != nil || port <= 0 || port > 65535 {
+			m.message = "Port number must be between 1 and 65535"
+			return m, nil
+		}
+		m.message = ""
+		m.addPort(port)
+		m.state = StateSelectPort
+		if pf := m.forwards[port]; pf != nil && pf.status != ForwardFailed {
+			// Already forwarding or starting
+			return m, nil
+		}
+		return m, m.startForward(port)
 	case "backspace":
 		if len(m.manualPort) > 0 {
 			m.manualPort = m.manualPort[:len(m.manualPort)-1]
@@ -230,42 +266,73 @@ func (m *Model) updateManualPort(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// updateStartingForward handles the starting forward state
-func (m *Model) updateStartingForward(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "ctrl+c", "q":
-		return m, tea.Quit
-	case "esc":
-		// Cancel the forwarding attempt
-		m.state = StateSelectPort
-		m.message = ""
-		return m, nil
+// addPort adds a port to the list if missing and moves the cursor to it
+func (m *Model) addPort(port int) {
+	i := sort.SearchInts(m.ports, port)
+	if i == len(m.ports) || m.ports[i] != port {
+		m.ports = slices.Insert(m.ports, i, port)
 	}
-	return m, nil
+	m.cursor = i
 }
 
-// updateForwarding handles forwarding state
-func (m *Model) updateForwarding(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "ctrl+c", "q":
-		if m.forwarder != nil {
-			m.forwarder.Stop()
-		}
-		return m, tea.Quit
-	case "esc":
-		if m.forwarder != nil {
-			m.forwarder.Stop()
-		}
-		m.state = StateSelectHost
-		m.cursor = 0
-		m.message = ""
-		return m, nil
+// toggleForward starts forwarding a port, or stops it if already forwarded
+func (m *Model) toggleForward(port int) tea.Cmd {
+	if pf := m.forwards[port]; pf != nil && pf.status != ForwardFailed {
+		m.stopForward(port)
+		return nil
 	}
-	return m, nil
+	return m.startForward(port)
+}
+
+// startForward spawns ssh for a port and returns a command that waits for it to be ready
+func (m *Model) startForward(port int) tea.Cmd {
+	m.nextID++
+	entry := &portForward{id: m.nextID, status: ForwardStarting}
+	m.forwards[port] = entry
+
+	localPort, _, err := findPreferredLocalPort(port)
+	if err != nil {
+		entry.status = ForwardFailed
+		entry.err = fmt.Errorf("no available local port: %w", err)
+		return nil
+	}
+	entry.localPort = localPort
+
+	forwarder := NewPortForwarder(m.hosts[m.selectedHost].Name, localPort, port)
+	if err := forwarder.Start(); err != nil {
+		entry.status = ForwardFailed
+		entry.err = err
+		return nil
+	}
+	entry.forwarder = forwarder
+
+	return WaitForwardReady(entry.id, forwarder)
+}
+
+// stopForward stops and forgets the forward for a port
+func (m *Model) stopForward(port int) {
+	if pf := m.forwards[port]; pf != nil && pf.forwarder != nil {
+		pf.forwarder.Stop()
+	}
+	delete(m.forwards, port)
+}
+
+// stopAllForwards stops every forward
+func (m *Model) stopAllForwards() {
+	for port := range m.forwards {
+		m.stopForward(port)
+	}
 }
 
 // View renders the TUI
-func (m *Model) View() string {
+func (m *Model) View() tea.View {
+	v := tea.NewView(m.render())
+	v.AltScreen = true
+	return v
+}
+
+// render builds the TUI content
+func (m *Model) render() string {
 	if m.err != nil {
 		errorStyle := lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FF5F87")).
@@ -284,7 +351,7 @@ func (m *Model) View() string {
 		Background(lipgloss.Color("#7D56F4")).
 		Padding(0, 1)
 
-	s.WriteString(headerStyle.Render("kport - SSH Port Forwarder"))
+	s.WriteString(headerStyle.Render("lport - SSH Port Forwarder"))
 	s.WriteString("\n\n")
 
 	switch m.state {
@@ -296,10 +363,6 @@ func (m *Model) View() string {
 		s.WriteString(m.renderPortSelection())
 	case StateManualPort:
 		s.WriteString(m.renderManualPort())
-	case StateStartingForward:
-		s.WriteString(m.renderStartingForward())
-	case StateForwarding:
-		s.WriteString(m.renderForwarding())
 	}
 
 	return s.String()
@@ -360,7 +423,7 @@ func (m *Model) renderPortSelection() string {
 	var s strings.Builder
 	
 	host := m.hosts[m.selectedHost]
-	s.WriteString(fmt.Sprintf("Detected ports on %s:\n\n", host.Name))
+	s.WriteString(fmt.Sprintf("Ports on %s:\n\n", host.Name))
 
 	if len(m.ports) == 0 {
 		if m.message != "" {
@@ -373,6 +436,12 @@ func (m *Model) renderPortSelection() string {
 		return s.String()
 	}
 
+	activeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Bold(true)
+	startingStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#00BFFF"))
+	failedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5F87"))
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#666666"))
+
+	active := 0
 	for i, port := range m.ports {
 		cursor := " "
 		if m.cursor == i {
@@ -384,12 +453,37 @@ func (m *Model) renderPortSelection() string {
 			style = style.Foreground(lipgloss.Color("#FF75B7"))
 		}
 
-		s.WriteString(fmt.Sprintf("%s %s\n", cursor, style.Render(fmt.Sprintf("Port %d", port))))
+		checkbox := "[ ]"
+		status := ""
+		if pf := m.forwards[port]; pf != nil {
+			switch pf.status {
+			case ForwardStarting:
+				checkbox = "[x]"
+				status = startingStyle.Render("◌ connecting...")
+			case ForwardActive:
+				active++
+				checkbox = "[x]"
+				status = activeStyle.Render(fmt.Sprintf("● localhost:%d", pf.localPort))
+				if pf.localPort != port {
+					status += dimStyle.Render(fmt.Sprintf(" (port %d was in use)", port))
+				}
+			case ForwardFailed:
+				status = failedStyle.Render(fmt.Sprintf("✗ %v", pf.err))
+			}
+		}
+
+		s.WriteString(fmt.Sprintf("%s %s %s  %s\n", cursor, style.Render(checkbox),
+			style.Render(fmt.Sprintf("Port %-5d", port)), status))
 	}
 
 	s.WriteString("\n")
+	if active > 0 {
+		s.WriteString(activeStyle.Render(fmt.Sprintf("✓ %d port(s) forwarding", active)))
+		s.WriteString("\n\n")
+	}
 	s.WriteString("Controls:\n")
-	s.WriteString("  ↑/↓: Navigate  Enter: Forward  m: Manual port  Esc: Back  q: Quit\n")
+	s.WriteString("  ↑/↓: Navigate  Space/Enter: Toggle forward  m: Add port\n")
+	s.WriteString("  Esc: Stop all & back  q: Stop all & quit\n")
 
 	return s.String()
 }
@@ -442,66 +536,16 @@ func (m *Model) renderManualPort() string {
 	} else {
 		s.WriteString("\n")
 	}
+
+	if m.message != "" {
+		errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5F87"))
+		s.WriteString(errorStyle.Render("✗ " + m.message))
+		s.WriteString("\n\n")
+	}
 	
 	s.WriteString("Controls:\n")
 	s.WriteString("  0-9: Enter digits  Backspace: Delete  Enter: Start forwarding\n")
 	s.WriteString("  Esc: Back  q: Quit\n")
-
-	return s.String()
-}
-
-// renderStartingForward renders the starting forward view
-func (m *Model) renderStartingForward() string {
-	var s strings.Builder
-	
-	startingStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#00BFFF")).
-		Bold(true)
-	
-	s.WriteString(startingStyle.Render("🚀 " + m.message))
-	s.WriteString("\n\n")
-	s.WriteString("Setting up SSH tunnel and port forwarding...\n\n")
-	s.WriteString("Controls:\n")
-	s.WriteString("  Esc: Cancel  q: Quit\n")
-
-	return s.String()
-}
-
-// renderForwarding renders the forwarding status view
-func (m *Model) renderForwarding() string {
-	var s strings.Builder
-	
-	successStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#04B575")).
-		Bold(true)
-	
-	s.WriteString(successStyle.Render("✓ Port Forwarding Active"))
-	s.WriteString("\n\n")
-	s.WriteString(m.message)
-	s.WriteString("\n\n")
-	
-	// Add helpful access information
-	accessStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#7D56F4")).
-		Bold(true)
-	
-	s.WriteString(accessStyle.Render("Access your service:"))
-	s.WriteString("\n")
-	
-	// Extract local port from message for display
-	if strings.Contains(m.message, "localhost:") {
-		parts := strings.Split(m.message, "localhost:")
-		if len(parts) > 1 {
-			portPart := strings.Split(parts[1], " ")[0]
-			s.WriteString(fmt.Sprintf("  • http://localhost:%s\n", portPart))
-			s.WriteString(fmt.Sprintf("  • https://localhost:%s\n", portPart))
-			s.WriteString(fmt.Sprintf("  • Or connect to localhost:%s with any client\n", portPart))
-		}
-	}
-	
-	s.WriteString("\n")
-	s.WriteString("Controls:\n")
-	s.WriteString("  Esc: Stop forwarding and return  q: Quit\n")
 
 	return s.String()
 }

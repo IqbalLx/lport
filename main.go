@@ -38,7 +38,7 @@ func main() {
 
 // testMode runs a simple test without TUI
 func testMode() {
-	fmt.Println("kport - SSH Port Forwarder - Test Mode")
+	fmt.Println("lport - SSH Port Forwarder - Test Mode")
 	fmt.Println("======================================")
 	
 	// Test SSH config loading
@@ -65,11 +65,11 @@ func testMode() {
 	fmt.Println("📝 Note: The example hosts above are not real servers.")
 	fmt.Println("   Replace them in ~/.ssh/config with your actual SSH hosts.")
 	fmt.Println("")
-	fmt.Println("To run the interactive TUI, use: ./kport")
+	fmt.Println("To run the interactive TUI, use: ./lport")
 	fmt.Println("Note: TUI requires a proper terminal environment")
 	fmt.Println("")
-	fmt.Println("To test connection to a specific host: ./kport --test-connect <hostname>")
-	fmt.Println("To test port mapping logic: ./kport --test-port <port>")
+	fmt.Println("To test connection to a specific host: ./lport --test-connect <hostname>")
+	fmt.Println("To test port mapping logic: ./lport --test-port <port>")
 }
 
 // testConnection tests connecting to a specific host
@@ -224,5 +224,5 @@ func testPortMapping(portStr string) {
 	}
 	
 	fmt.Println("")
-	fmt.Println("This is how kport will map the ports when forwarding.")
+	fmt.Println("This is how lport will map the ports when forwarding.")
 }
