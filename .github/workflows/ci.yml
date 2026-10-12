@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Formatted
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "run gofmt -w on:"; echo "$unformatted"; exit 1; fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # The forwarding tests use testdata/fake-ssh (python3, preinstalled on the runners) so they run
+      # real processes and sockets without an SSH server.
+      - name: Tests
+        run: go test -race -count=1 ./...
+
+      - name: Builds for every OS
+        run: |
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64; do
+            GOOS=${target%/*} GOARCH=${target#*/} go build -o /dev/null . || exit 1
+          done
+
+  install:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Shellcheck
+        run: shellcheck install.sh scripts/*.sh
+
+      # Build a release the way release.yml does and install it with install.sh from a local mirror,
+      # so the installer and the release layout can't drift apart.
+      - name: Install from a local release
+        run: |
+          set -eu
+          scripts/build-release.sh v0.0.0-ci linux-x64
+          mirror=$(mktemp -d)
+          mkdir -p "$mirror/v0.0.0-ci"
+          cp dist/release/lport-v0.0.0-ci-linux-x64.tar.gz "$mirror/v0.0.0-ci/"
+          (cd "$mirror/v0.0.0-ci" && sha256sum lport-*.tar.gz > SHA256SUMS)
+          home=$(mktemp -d)
+          export LPORT_DOWNLOAD_BASE="file://$mirror" LPORT_VERSION=v0.0.0-ci LPORT_HOME="$home/.lport" LPORT_NO_MODIFY_PATH=1
+          sh install.sh
+          test "$("$home/.lport/bin/lport" --version)" = v0.0.0-ci
+          # A second run is a no-op
+          sh install.sh | grep -q "already installed"

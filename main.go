@@ -9,25 +9,33 @@ import (
 	"strings"
 )
 
+// version is set at build time with -ldflags "-X main.version=v1.2.3"
+var version = "dev"
+
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		fmt.Println(version)
+		return
+	}
+
 	// Check for test mode
 	if len(os.Args) > 1 && os.Args[1] == "--test" {
 		testMode()
 		return
 	}
-	
+
 	// Check for connection test mode
 	if len(os.Args) > 2 && os.Args[1] == "--test-connect" {
 		testConnection(os.Args[2])
 		return
 	}
-	
+
 	// Check for port mapping test mode
 	if len(os.Args) > 2 && os.Args[1] == "--test-port" {
 		testPortMapping(os.Args[2])
 		return
 	}
-	
+
 	// Initialize the application
 	app := NewApp()
 	if err := app.Run(); err != nil {
@@ -40,17 +48,17 @@ func main() {
 func testMode() {
 	fmt.Println("lport - SSH Port Forwarder - Test Mode")
 	fmt.Println("======================================")
-	
+
 	// Test SSH config loading
 	config := NewSSHConfig()
 	if err := config.LoadConfig(); err != nil {
 		fmt.Printf("❌ Failed to load SSH config: %v\n", err)
 		return
 	}
-	
+
 	hosts := config.GetHosts()
 	fmt.Printf("✅ Successfully loaded SSH config with %d hosts:\n\n", len(hosts))
-	
+
 	for i, host := range hosts {
 		fmt.Printf("%d. %s\n", i+1, host.Name)
 		fmt.Printf("   Host: %s\n", host.Hostname)
@@ -61,7 +69,7 @@ func testMode() {
 		}
 		fmt.Println()
 	}
-	
+
 	fmt.Println("📝 Note: The example hosts above are not real servers.")
 	fmt.Println("   Replace them in ~/.ssh/config with your actual SSH hosts.")
 	fmt.Println("")
@@ -76,21 +84,21 @@ func testMode() {
 func testConnection(hostName string) {
 	fmt.Printf("Testing connection to host: %s\n", hostName)
 	fmt.Println("=====================================")
-	
+
 	// Load SSH config
 	config := NewSSHConfig()
 	if err := config.LoadConfig(); err != nil {
 		fmt.Printf("❌ Failed to load SSH config: %v\n", err)
 		return
 	}
-	
+
 	// Find the host
 	host, err := config.GetHostByName(hostName)
 	if err != nil {
 		fmt.Printf("❌ Host not found: %v\n", err)
 		return
 	}
-	
+
 	fmt.Printf("Found host configuration:\n")
 	fmt.Printf("  Name: %s\n", host.Name)
 	fmt.Printf("  Hostname: %s\n", host.Hostname)
@@ -100,12 +108,12 @@ func testConnection(hostName string) {
 		fmt.Printf("  Identity: %s\n", host.Identity)
 	}
 	fmt.Println("")
-	
+
 	// Expand shell variables in the host config
 	expandedHost := *host
 	expandedHost.User = expandShellVars(host.User)
 	expandedHost.Identity = expandShellVars(host.Identity)
-	
+
 	if expandedHost.User != host.User {
 		fmt.Printf("Expanded user: %s -> %s\n", host.User, expandedHost.User)
 	}
@@ -115,11 +123,11 @@ func testConnection(hostName string) {
 	if expandedHost.User != host.User || expandedHost.Identity != host.Identity {
 		fmt.Println("")
 	}
-	
+
 	// Test SSH connection using ssh command (supports all SSH features)
 	fmt.Println("Testing SSH connection...")
 	fmt.Printf("Running: ssh -o ConnectTimeout=10 -o BatchMode=yes %s echo 'connection test'\n", expandedHost.Name)
-	
+
 	sshCmd := exec.Command("ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", expandedHost.Name, "echo", "connection test")
 	output, err := sshCmd.Output()
 	if err != nil {
@@ -136,14 +144,14 @@ func testConnection(hostName string) {
 		fmt.Printf("  ssh %s\n", expandedHost.Name)
 		return
 	}
-	
+
 	if strings.TrimSpace(string(output)) == "connection test" {
 		fmt.Printf("✅ SSH connection successful!\n")
 	} else {
 		fmt.Printf("⚠️  SSH connection partially successful but got unexpected output: %s\n", string(output))
 	}
 	fmt.Println("")
-	
+
 	// Test port detection
 	fmt.Println("Testing port detection...")
 	ports, err := detectRemotePorts(expandedHost)
@@ -158,7 +166,7 @@ func testConnection(hostName string) {
 	} else {
 		fmt.Printf("✅ Port detection successful! Found %d ports: %v\n", len(ports), ports)
 	}
-	
+
 	fmt.Println("")
 	fmt.Println("You can still use manual port forwarding in the TUI even if port detection fails.")
 }
@@ -168,7 +176,7 @@ func expandShellVars(value string) string {
 	if value == "" {
 		return value
 	}
-	
+
 	// Handle $(whoami) and $USER
 	if strings.Contains(value, "$(whoami)") || strings.Contains(value, "$USER") {
 		currentUser, err := user.Current()
@@ -177,7 +185,7 @@ func expandShellVars(value string) string {
 			value = strings.ReplaceAll(value, "$USER", currentUser.Username)
 		}
 	}
-	
+
 	// Handle $HOME and ~/
 	if strings.Contains(value, "$HOME") || strings.HasPrefix(value, "~/") {
 		homeDir, err := os.UserHomeDir()
@@ -188,7 +196,7 @@ func expandShellVars(value string) string {
 			}
 		}
 	}
-	
+
 	return value
 }
 
@@ -196,25 +204,25 @@ func expandShellVars(value string) string {
 func testPortMapping(portStr string) {
 	fmt.Printf("Testing port mapping for port: %s\n", portStr)
 	fmt.Println("=====================================")
-	
+
 	remotePort, err := strconv.Atoi(portStr)
 	if err != nil {
 		fmt.Printf("❌ Invalid port number: %s\n", portStr)
 		return
 	}
-	
+
 	if remotePort <= 0 || remotePort > 65535 {
 		fmt.Printf("❌ Port number must be between 1 and 65535\n")
 		return
 	}
-	
+
 	// Test the port mapping logic
 	localPort, samePort, err := findPreferredLocalPort(remotePort)
 	if err != nil {
 		fmt.Printf("❌ Failed to find available port: %v\n", err)
 		return
 	}
-	
+
 	if samePort {
 		fmt.Printf("✅ Port %d is available locally - using same port\n", localPort)
 		fmt.Printf("   Mapping: localhost:%d -> remote:%d\n", localPort, remotePort)
@@ -222,7 +230,7 @@ func testPortMapping(portStr string) {
 		fmt.Printf("⚠️  Port %d is unavailable locally - using alternative port %d\n", remotePort, localPort)
 		fmt.Printf("   Mapping: localhost:%d -> remote:%d\n", localPort, remotePort)
 	}
-	
+
 	fmt.Println("")
 	fmt.Println("This is how lport will map the ports when forwarding.")
 }

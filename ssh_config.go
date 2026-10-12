@@ -71,7 +71,7 @@ func (sc *SSHConfig) loadConfigFromFileRecursive(path string, visited map[string
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		
+
 		// Skip empty lines and comments
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -201,9 +201,9 @@ func parseConfigLine(line string) (key, value string, err error) {
 	valueStr := strings.TrimSpace(parts[1])
 
 	// Handle quoted values
-	if len(valueStr) >= 2 && 
+	if len(valueStr) >= 2 &&
 		((valueStr[0] == '"' && valueStr[len(valueStr)-1] == '"') ||
-		 (valueStr[0] == '\'' && valueStr[len(valueStr)-1] == '\'')) {
+			(valueStr[0] == '\'' && valueStr[len(valueStr)-1] == '\'')) {
 		// Remove quotes
 		value = valueStr[1 : len(valueStr)-1]
 	} else {

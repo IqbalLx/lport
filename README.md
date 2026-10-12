@@ -18,31 +18,38 @@ A terminal user interface (TUI) application for SSH port forwarding that reads f
 - **Multi-Port Forwarding**: Toggle any number of ports with checkboxes; each shows a live status indicator
 - **Manual Port Forwarding**: Add remote ports that weren't detected
 - **Smart Port Mapping**: Tries to use same port locally (e.g., remote:3000 → localhost:3000)
+- **Detach**: Quit with `d` to leave tunnels running; the next `lport` finds them again so you can keep or close them
 - **Real-time Port Forwarding**: Creates SSH tunnels using `ssh -L` command
 - **Clean TUI Interface**: Built with Bubble Tea for a smooth terminal experience
 
 ## Installation
 
-```bash
-go install github.com/IqbalLx/lport@latest
+On macOS or Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/IqbalLx/lport/main/install.sh | sh
 ```
 
-Or from a clone:
+Then open a new terminal and run `lport`. Running the same command again updates it.
 
-```bash
-go build -o lport
-```
+The installer checks the download against the release checksums, installs into `~/.lport/bin` without `sudo`, and adds that folder to PATH in your shell's startup file (one marked block). Overrides:
+
+- `LPORT_VERSION=v0.1.0` installs a specific release
+- `LPORT_HOME=...` installs somewhere other than `~/.lport`
+- `LPORT_NO_MODIFY_PATH=1` leaves your shell startup file alone
+
+With Go 1.26+ you can also run `go install github.com/IqbalLx/lport@latest`, or `go build -o lport` from a clone.
 
 ## Usage
 
 1. **Run the application**:
    ```bash
-   ./lport
+   lport
    ```
 
 2. **Test port mapping** (optional):
    ```bash
-   ./lport --test-port 3000
+   lport --test-port 3000
    # Shows: ✅ Port 3000 available locally - using same port
    #        Mapping: localhost:3000 -> remote:3000
    ```
@@ -76,20 +83,40 @@ go build -o lport
    - If unavailable, it uses a random available port
    - Clear feedback shows the actual mapping and access URLs
 
+6. **Leaving**:
+   - `q` closes every tunnel and quits
+   - `d` detaches: lport quits but the tunnels keep running, even after you close the terminal. It prints what is still open:
+     ```
+     Detached. 2 forward(s) still running:
+       my-server:5432 -> localhost:5432
+       my-server:8080 -> localhost:54012
+     Run lport again to manage them.
+     ```
+   - The next time you start lport it finds those tunnels and opens the **Active forwards** screen, where you can close them (Space/Enter) or keep them (Esc). Tunnels left by kport are recognized too.
+
 ## Controls
 
 ### Host Selection
 - `↑/↓` or `j/k`: Navigate through SSH hosts
 - `Enter`: Select host and detect ports
 - `m`: Manual port forwarding for selected host
-- `q`: Quit application
+- `a`: Active forwards across all hosts
+- `d`: Detach (quit, keep tunnels running)
+- `q`: Quit and close all tunnels
 
 ### Port Selection
 - `↑/↓` or `j/k`: Navigate through detected ports
 - `Space` / `Enter`: Toggle forwarding for the selected port
 - `m`: Add a port manually
-- `Esc`: Stop all forwards and go back to host selection
-- `q`: Stop all forwards and quit
+- `Esc`: Back to host selection (tunnels keep running)
+- `d`: Detach (quit, keep tunnels running)
+- `q`: Quit and close all tunnels
+
+### Active Forwards
+- `↑/↓` or `j/k`: Navigate
+- `Space` / `Enter`: Close a tunnel, or reopen it
+- `Esc`: Back to host selection
+- `d` / `q`: Detach / quit and close all tunnels
 
 ### Manual Port Entry
 - `0-9`: Enter port number
@@ -186,6 +213,23 @@ The application gracefully handles connection failures and allows you to:
 - **Consistent Behavior**: Same authentication and connection logic as your terminal
 - **SSH Container Support**: Works with containers that require ProxyCommand
 - **No Additional Setup**: If `ssh hostname` works, lport works too
+
+## Development
+
+```sh
+go test -race ./...   # forwarding tests use testdata/fake-ssh (needs python3), no SSH server required
+go build -o lport
+```
+
+CI runs formatting, vet and the tests on Linux and macOS, shellchecks `install.sh`, and installs a locally built release with it.
+
+To release, push a tag:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The release workflow builds `darwin-arm64`, `darwin-x64`, `linux-x64` and `linux-arm64` on matching runners, smoke-tests each binary, and publishes them with `SHA256SUMS` for `install.sh`.
 
 ## License
 
