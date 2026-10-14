@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,6 +16,9 @@ import (
 // PortsDetectedMsg is sent when ports are detected
 type PortsDetectedMsg struct {
 	Ports []int
+	// Programs maps a port to the program listening on it, when the remote
+	// host reveals it (usually only for processes owned by the SSH user)
+	Programs map[int]string
 }
 
 // ErrorMsg is sent when an error occurs
@@ -24,71 +29,110 @@ type ErrorMsg struct {
 // DetectPorts detects open ports on the remote host
 func DetectPorts(host SSHHost) tea.Cmd {
 	return func() tea.Msg {
-		ports, err := detectRemotePorts(host)
+		ports, programs, err := detectRemotePorts(host)
 		if err != nil {
-			// Log the error for debugging but don't quit the app
-			fmt.Fprintf(os.Stderr, "Debug: Port detection failed for %s: %v\n", host.Name, err)
 			// Return empty ports list so user can still use manual port forwarding
 			return PortsDetectedMsg{Ports: []int{}}
 		}
-		fmt.Fprintf(os.Stderr, "Debug: Detected %d ports on %s: %v\n", len(ports), host.Name, ports)
-		return PortsDetectedMsg{Ports: ports}
+		return PortsDetectedMsg{Ports: ports, Programs: programs}
 	}
 }
 
+// listenersScript lists listening TCP sockets with the first tool available.
+// Each attempt prints a marker so the output can be parsed in the right format.
+const listenersScript = `(echo '#ss'; ss -tlnp) 2>/dev/null ||
+(echo '#netstat'; netstat -tlnp) 2>/dev/null ||
+(echo '#lsof'; lsof -nP -iTCP -sTCP:LISTEN) 2>/dev/null`
+
 // detectRemotePorts connects to the remote host and detects open ports using ssh command
-func detectRemotePorts(host SSHHost) ([]int, error) {
-	// Try different commands to detect listening ports
-	commands := []string{
-		"netstat -tlnp 2>/dev/null | grep LISTEN | awk '{print $4}' | cut -d: -f2 | sort -n | uniq",
-		"ss -tlnp 2>/dev/null | grep LISTEN | awk '{print $4}' | cut -d: -f2 | sort -n | uniq",
-		"lsof -i -P -n 2>/dev/null | grep LISTEN | awk '{print $9}' | cut -d: -f2 | sort -n | uniq",
-	}
+func detectRemotePorts(host SSHHost) ([]int, map[int]string, error) {
+	// Use ssh command directly - this supports all SSH features including ProxyCommand
+	sshCmd := exec.Command("ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host.Name, listenersScript)
+	output, _ := sshCmd.Output() // the script exits non-zero when the last tool is missing
 
-	var output []byte
-	var err error
-
-	for _, cmd := range commands {
-		fmt.Fprintf(os.Stderr, "Debug: Running command on %s: %s\n", host.Name, cmd)
-
-		// Use ssh command directly - this supports all SSH features including ProxyCommand
-		sshCmd := exec.Command("ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host.Name, cmd)
-
-		output, err = sshCmd.Output()
-		if err == nil && len(output) > 0 {
-			fmt.Fprintf(os.Stderr, "Debug: Command succeeded, got output\n")
-			break
-		}
-		fmt.Fprintf(os.Stderr, "Debug: Command failed: %v\n", err)
-	}
-
-	if err != nil || len(output) == 0 {
-		fmt.Fprintf(os.Stderr, "Debug: All port detection commands failed, trying common ports\n")
+	ports, programs := parseListeners(string(output))
+	if len(ports) == 0 {
 		// Fallback: try common ports
-		return detectCommonPorts(host), nil
+		return detectCommonPorts(host), nil, nil
 	}
+	return ports, programs, nil
+}
 
-	// Parse the output to extract port numbers
-	ports := make([]int, 0)
-	lines := strings.Split(string(output), "\n")
+var ssProgramPattern = regexp.MustCompile(`users:\(\("([^"]+)"`)
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
+// parseListeners parses the output of listenersScript into sorted ports and
+// the programs listening on them
+func parseListeners(output string) ([]int, map[int]string) {
+	names := make(map[int][]string)
+	format := ""
+
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "#") {
+			format = strings.TrimSpace(line[1:])
+			continue
+		}
+		fields := strings.Fields(line)
+
+		var address, program string
+		switch format {
+		case "ss":
+			// LISTEN 0 511 127.0.0.1:6379 0.0.0.0:* users:(("redis-server",pid=1,fd=6))
+			if len(fields) < 4 || fields[0] != "LISTEN" {
+				continue
+			}
+			address = fields[3]
+			if m := ssProgramPattern.FindStringSubmatch(line); m != nil {
+				program = m[1]
+			}
+		case "netstat":
+			// tcp 0 0 127.0.0.1:6379 0.0.0.0:* LISTEN 1234/redis-server
+			if len(fields) < 6 || !strings.HasPrefix(fields[0], "tcp") || fields[5] != "LISTEN" {
+				continue
+			}
+			address = fields[3]
+			if len(fields) > 6 {
+				if _, name, ok := strings.Cut(fields[6], "/"); ok {
+					program = name
+				}
+			}
+		case "lsof":
+			// redis-ser 1234 user 6u IPv4 0x1 0t0 TCP 127.0.0.1:6379 (LISTEN)
+			if len(fields) < 10 || fields[len(fields)-1] != "(LISTEN)" {
+				continue
+			}
+			address = fields[len(fields)-2]
+			program = strings.ReplaceAll(fields[0], `\x20`, " ")
+		default:
 			continue
 		}
 
-		port, err := strconv.Atoi(line)
-		if err == nil && port > 0 && port < 65536 {
-			ports = append(ports, port)
+		// The port follows the last colon: 0.0.0.0:80, [::]:80, *:80, 127.0.0.53%lo:53
+		i := strings.LastIndex(address, ":")
+		if i < 0 {
+			continue
+		}
+		port, err := strconv.Atoi(address[i+1:])
+		if err != nil || port <= 0 || port > 65535 {
+			continue
+		}
+		if _, seen := names[port]; !seen {
+			names[port] = nil
+		}
+		if program != "" && !slices.Contains(names[port], program) {
+			names[port] = append(names[port], program)
 		}
 	}
 
-	// Remove duplicates and sort
-	ports = removeDuplicates(ports)
+	ports := make([]int, 0, len(names))
+	programs := make(map[int]string)
+	for port, list := range names {
+		ports = append(ports, port)
+		if len(list) > 0 {
+			programs[port] = strings.Join(list, ",")
+		}
+	}
 	sort.Ints(ports)
-
-	return ports, nil
+	return ports, programs
 }
 
 // detectCommonPorts tries to detect common ports by testing connections through SSH
@@ -111,19 +155,4 @@ func detectCommonPorts(host SSHHost) []int {
 	}
 
 	return openPorts
-}
-
-// removeDuplicates removes duplicate integers from a slice
-func removeDuplicates(slice []int) []int {
-	keys := make(map[int]bool)
-	result := make([]int, 0)
-
-	for _, item := range slice {
-		if !keys[item] {
-			keys[item] = true
-			result = append(result, item)
-		}
-	}
-
-	return result
 }

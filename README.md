@@ -14,7 +14,7 @@ A terminal user interface (TUI) application for SSH port forwarding that reads f
 - **Include Support**: Supports SSH config `Include` directive with glob patterns
 - **Full SSH Compatibility**: Uses native `ssh` command - supports ProxyCommand, jump hosts, and all SSH features
 - **Interactive Host Selection**: Choose from configured SSH hosts using arrow keys
-- **Automatic Port Detection**: Scans remote host for listening ports using `netstat`, `ss`, or `lsof`
+- **Automatic Port Detection**: Scans remote host for listening ports and the programs behind them using `ss`, `netstat`, or `lsof`
 - **Multi-Port Forwarding**: Toggle any number of ports with checkboxes; each shows a live status indicator
 - **Manual Port Forwarding**: Add remote ports that weren't detected
 - **Smart Port Mapping**: Tries to use same port locally (e.g., remote:3000 → localhost:3000)
@@ -66,10 +66,10 @@ With Go 1.26+ you can also run `go install github.com/IqbalLx/lport@latest`, or 
    Ports on my-server:
 
      [ ] Port 22
-     [x] Port 3000   ◌ connecting...
-     [x] Port 5432   ● localhost:5432
-   > [x] Port 8080   ● localhost:54012 (port 8080 was in use)
-     [ ] Port 9000   ✗ connect to host my-server port 22: Connection refused
+     [x] Port 3000   node      ◌ connecting...
+     [x] Port 5432             ● localhost:5432
+   > [x] Port 8080   api       ● localhost:54012 (port 8080 was in use)
+     [ ] Port 9000   python3   ✗ connect to host my-server port 22: Connection refused
 
    ✓ 2 port(s) forwarding
    ```
@@ -77,6 +77,7 @@ With Go 1.26+ you can also run `go install github.com/IqbalLx/lport@latest`, or 
    - `◌ connecting...` - the tunnel is being set up
    - `● localhost:N` - the tunnel is accepting connections on localhost
    - `✗ reason` - the tunnel failed or dropped; toggle again to retry
+   - The name next to a port is the program listening on it. Remote hosts only reveal this for processes owned by your SSH user, so ports run by root or other users (system services, Docker) show no name
 
 5. **Port Forwarding**: 
    - lport tries to use the same port locally (e.g., remote:3000 → localhost:3000)

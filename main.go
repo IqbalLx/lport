@@ -154,7 +154,7 @@ func testConnection(hostName string) {
 
 	// Test port detection
 	fmt.Println("Testing port detection...")
-	ports, err := detectRemotePorts(expandedHost)
+	ports, programs, err := detectRemotePorts(expandedHost)
 	if err != nil {
 		fmt.Printf("❌ Port detection failed: %v\n", err)
 		fmt.Println("")
@@ -164,7 +164,10 @@ func testConnection(hostName string) {
 		fmt.Println("- SSH agent is not running")
 		fmt.Println("- The host doesn't exist")
 	} else {
-		fmt.Printf("✅ Port detection successful! Found %d ports: %v\n", len(ports), ports)
+		fmt.Printf("✅ Port detection successful! Found %d ports:\n", len(ports))
+		for _, port := range ports {
+			fmt.Printf("   %-5d %s\n", port, programs[port])
+		}
 	}
 
 	fmt.Println("")

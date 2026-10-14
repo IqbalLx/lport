@@ -50,7 +50,8 @@ type Model struct {
 	cursor       int
 	manualPort   string
 	forwards     map[forwardKey]*portForward
-	overview     []forwardKey // rows of the active forwards screen
+	programs     map[forwardKey]string // program listening on each detected port
+	overview     []forwardKey          // rows of the active forwards screen
 	nextID       int
 	detached     bool
 	message      string
@@ -64,6 +65,7 @@ func NewModel() *Model {
 		sshConfig: NewSSHConfig(),
 		cursor:    0,
 		forwards:  make(map[forwardKey]*portForward),
+		programs:  make(map[forwardKey]string),
 	}
 }
 
@@ -122,8 +124,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.ports = msg.Ports
-		// Also list ports already forwarded for this host, even if not detected
 		hostName := m.hosts[m.selectedHost].Name
+		for key := range m.programs {
+			if key.host == hostName {
+				delete(m.programs, key)
+			}
+		}
+		for port, program := range msg.Programs {
+			m.programs[forwardKey{host: hostName, remotePort: port}] = program
+		}
+		// Also list ports already forwarded for this host, even if not detected
 		for key := range m.forwards {
 			if key.host == hostName {
 				m.insertPort(key.remotePort)
@@ -593,7 +603,13 @@ func (m *Model) renderPortSelection() string {
 		return s.String()
 	}
 
+	keys := make([]forwardKey, len(m.ports))
 	for i, port := range m.ports {
+		keys[i] = m.hostKey(port)
+	}
+	programWidth := m.programWidth(keys)
+
+	for i, key := range keys {
 		cursor := " "
 		style := lipgloss.NewStyle()
 		if m.cursor == i {
@@ -601,9 +617,9 @@ func (m *Model) renderPortSelection() string {
 			style = style.Foreground(lipgloss.Color("#FF75B7"))
 		}
 
-		checkbox, status, _ := m.renderForwardStatus(m.hostKey(port))
-		s.WriteString(fmt.Sprintf("%s %s %s  %s\n", cursor, style.Render(checkbox),
-			style.Render(fmt.Sprintf("Port %-5d", port)), status))
+		checkbox, status, _ := m.renderForwardStatus(key)
+		s.WriteString(fmt.Sprintf("%s %s %s%s  %s\n", cursor, style.Render(checkbox),
+			style.Render(fmt.Sprintf("Port %-5d", key.remotePort)), m.renderProgram(key, programWidth), status))
 	}
 
 	s.WriteString("\n")
@@ -616,6 +632,30 @@ func (m *Model) renderPortSelection() string {
 	s.WriteString("  d: Detach (keep forwards)  q: Quit (close forwards)\n")
 
 	return s.String()
+}
+
+// maxProgramWidth caps the program column so long names don't push the status off screen
+const maxProgramWidth = 20
+
+// programWidth returns the width of the program column for these rows, 0 if none are known
+func (m *Model) programWidth(keys []forwardKey) int {
+	width := 0
+	for _, key := range keys {
+		width = max(width, len([]rune(m.programs[key])))
+	}
+	return min(width, maxProgramWidth)
+}
+
+// renderProgram renders the program column for a row, padded to width
+func (m *Model) renderProgram(key forwardKey, width int) string {
+	if width == 0 {
+		return ""
+	}
+	name := []rune(m.programs[key])
+	if len(name) > width {
+		name = append(name[:width-1], '…')
+	}
+	return "  " + dimStyle.Render(fmt.Sprintf("%-*s", width, string(name)))
 }
 
 // renderActiveForwards renders the overview of forwards across all hosts
@@ -632,6 +672,7 @@ func (m *Model) renderActiveForwards() string {
 	for _, key := range m.overview {
 		width = max(width, len(key.host))
 	}
+	programWidth := m.programWidth(m.overview)
 
 	for i, key := range m.overview {
 		cursor := " "
@@ -642,8 +683,9 @@ func (m *Model) renderActiveForwards() string {
 		}
 
 		checkbox, status, _ := m.renderForwardStatus(key)
-		s.WriteString(fmt.Sprintf("%s %s %s  %s\n", cursor, style.Render(checkbox),
-			style.Render(fmt.Sprintf("%-*s  Port %-5d", width, key.host, key.remotePort)), status))
+		s.WriteString(fmt.Sprintf("%s %s %s%s  %s\n", cursor, style.Render(checkbox),
+			style.Render(fmt.Sprintf("%-*s  Port %-5d", width, key.host, key.remotePort)),
+			m.renderProgram(key, programWidth), status))
 	}
 
 	s.WriteString("\n")
