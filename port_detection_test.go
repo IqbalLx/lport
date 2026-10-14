@@ -55,6 +55,28 @@ my\x20app   777 me     3u  IPv4 0x3      0t0  TCP *:8080 (LISTEN)
 			programs: map[int]string{5432: "postgres", 8080: "my app"},
 		},
 		{
+			name: "docker containers name their published ports",
+			output: `#ss
+LISTEN 0      4096          0.0.0.0:5432       0.0.0.0:*
+LISTEN 0      4096             [::]:5432          [::]:*
+LISTEN 0      4096          0.0.0.0:80         0.0.0.0:*    users:(("docker-proxy",pid=9,fd=4))
+LISTEN 0      4096        127.0.0.1:8000       0.0.0.0:*    users:(("api",pid=2,fd=7))
+#docker
+imigrasi_lgtm|3200/tcp, 0.0.0.0:4317-4318->4317-4318/tcp, [::]:4317-4318->4317-4318/tcp, 0.0.0.0:3300->3000/tcp
+imigrasi_pgsql|0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp
+dashboard|0.0.0.0:80->8501/tcp
+dns|0.0.0.0:5353->53/udp
+idle|
+#podman
+`,
+			// 3300/4317/4318 are published (DNAT) without a host listener; 3200 and udp are not reachable
+			ports: []int{80, 3300, 4317, 4318, 5432, 8000},
+			programs: map[int]string{
+				80: "docker:dashboard", 3300: "docker:imigrasi_lgtm", 4317: "docker:imigrasi_lgtm",
+				4318: "docker:imigrasi_lgtm", 5432: "docker:imigrasi_pgsql", 8000: "api",
+			},
+		},
+		{
 			name:     "nothing available",
 			output:   "#ss\n#netstat\n#lsof\n",
 			ports:    []int{},

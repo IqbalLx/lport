@@ -635,7 +635,7 @@ func (m *Model) renderPortSelection() string {
 }
 
 // maxProgramWidth caps the program column so long names don't push the status off screen
-const maxProgramWidth = 20
+const maxProgramWidth = 28
 
 // programWidth returns the width of the program column for these rows, 0 if none are known
 func (m *Model) programWidth(keys []forwardKey) int {

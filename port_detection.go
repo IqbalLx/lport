@@ -38,11 +38,17 @@ func DetectPorts(host SSHHost) tea.Cmd {
 	}
 }
 
-// listenersScript lists listening TCP sockets with the first tool available.
-// Each attempt prints a marker so the output can be parsed in the right format.
+// listenersScript lists listening TCP sockets with the first tool available,
+// then the ports published by containers: those are owned by root's
+// docker-proxy, so ss can't name them, but docker ps can if the user is in
+// the docker group. Each part prints a marker so the output can be parsed in
+// the right format.
 const listenersScript = `(echo '#ss'; ss -tlnp) 2>/dev/null ||
 (echo '#netstat'; netstat -tlnp) 2>/dev/null ||
-(echo '#lsof'; lsof -nP -iTCP -sTCP:LISTEN) 2>/dev/null`
+(echo '#lsof'; lsof -nP -iTCP -sTCP:LISTEN) 2>/dev/null
+(echo '#docker'; docker ps --format '{{.Names}}|{{.Ports}}') 2>/dev/null
+(echo '#podman'; podman ps --format '{{.Names}}|{{.Ports}}') 2>/dev/null
+true`
 
 // detectRemotePorts connects to the remote host and detects open ports using ssh command
 func detectRemotePorts(host SSHHost) ([]int, map[int]string, error) {
@@ -64,6 +70,7 @@ var ssProgramPattern = regexp.MustCompile(`users:\(\("([^"]+)"`)
 // the programs listening on them
 func parseListeners(output string) ([]int, map[int]string) {
 	names := make(map[int][]string)
+	containers := make(map[int][]string)
 	format := ""
 
 	for _, line := range strings.Split(output, "\n") {
@@ -75,6 +82,19 @@ func parseListeners(output string) ([]int, map[int]string) {
 
 		var address, program string
 		switch format {
+		case "docker", "podman":
+			// imigrasi_pgsql|0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp
+			name, ports, ok := strings.Cut(line, "|")
+			if !ok {
+				continue
+			}
+			for _, port := range parsePublishedPorts(ports) {
+				label := format + ":" + name
+				if !slices.Contains(containers[port], label) {
+					containers[port] = append(containers[port], label)
+				}
+			}
+			continue
 		case "ss":
 			// LISTEN 0 511 127.0.0.1:6379 0.0.0.0:* users:(("redis-server",pid=1,fd=6))
 			if len(fields) < 4 || fields[0] != "LISTEN" {
@@ -123,6 +143,12 @@ func parseListeners(output string) ([]int, map[int]string) {
 		}
 	}
 
+	// A container name says more than docker-proxy (or nothing at all), and
+	// published ports are reachable even when no host process is listening
+	for port, labels := range containers {
+		names[port] = labels
+	}
+
 	ports := make([]int, 0, len(names))
 	programs := make(map[int]string)
 	for port, list := range names {
@@ -155,4 +181,33 @@ func detectCommonPorts(host SSHHost) []int {
 	}
 
 	return openPorts
+}
+
+// parsePublishedPorts returns the host TCP ports in a docker/podman ps Ports
+// column, e.g. "0.0.0.0:4317-4318->4317-4318/tcp, [::]:80->8501/tcp, 3200/tcp".
+// Exposed but unpublished ports (no "->") aren't reachable from the host.
+func parsePublishedPorts(column string) []int {
+	var ports []int
+	for _, mapping := range strings.Split(column, ",") {
+		hostSide, containerSide, ok := strings.Cut(strings.TrimSpace(mapping), "->")
+		if !ok || !strings.HasSuffix(containerSide, "/tcp") {
+			continue
+		}
+		hostPorts := hostSide[strings.LastIndex(hostSide, ":")+1:]
+		first, last, isRange := strings.Cut(hostPorts, "-")
+		if !isRange {
+			last = first
+		}
+		lo, err1 := strconv.Atoi(first)
+		hi, err2 := strconv.Atoi(last)
+		if err1 != nil || err2 != nil || lo <= 0 || hi > 65535 || hi < lo || hi-lo > 1000 {
+			continue
+		}
+		for port := lo; port <= hi; port++ {
+			if !slices.Contains(ports, port) {
+				ports = append(ports, port)
+			}
+		}
+	}
+	return ports
 }

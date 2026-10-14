@@ -66,10 +66,10 @@ With Go 1.26+ you can also run `go install github.com/IqbalLx/lport@latest`, or 
    Ports on my-server:
 
      [ ] Port 22
-     [x] Port 3000   node      ◌ connecting...
-     [x] Port 5432             ● localhost:5432
-   > [x] Port 8080   api       ● localhost:54012 (port 8080 was in use)
-     [ ] Port 9000   python3   ✗ connect to host my-server port 22: Connection refused
+     [x] Port 3000   node             ◌ connecting...
+     [x] Port 5432   docker:postgres  ● localhost:5432
+   > [x] Port 8080   api              ● localhost:54012 (port 8080 was in use)
+     [ ] Port 9000   python3          ✗ connect to host my-server port 22: Connection refused
 
    ✓ 2 port(s) forwarding
    ```
@@ -77,7 +77,8 @@ With Go 1.26+ you can also run `go install github.com/IqbalLx/lport@latest`, or 
    - `◌ connecting...` - the tunnel is being set up
    - `● localhost:N` - the tunnel is accepting connections on localhost
    - `✗ reason` - the tunnel failed or dropped; toggle again to retry
-   - The name next to a port is the program listening on it. Remote hosts only reveal this for processes owned by your SSH user, so ports run by root or other users (system services, Docker) show no name
+   - The name next to a port is the program listening on it. Remote hosts only reveal this for processes owned by your SSH user, so ports run by root or other users (system services) show no name
+   - Ports published by Docker or Podman containers show the container, e.g. `docker:postgres`. This needs your SSH user to be able to run `docker ps` (be in the `docker` group); published ports are listed even when no host process listens on them
 
 5. **Port Forwarding**: 
    - lport tries to use the same port locally (e.g., remote:3000 → localhost:3000)
